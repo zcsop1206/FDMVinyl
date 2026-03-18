@@ -2,7 +2,9 @@
 
 A full signal conditioning and structural mapping pipeline that encodes digital audio into 3D-printable groove geometry. Built to explore physical signal recovery under severe manufacturing constraints.
 
-**[Link to 60-Second Video Demo]** *(Embed Deliverable 5 video here)*
+
+![Open Vinyl Project Demo](media/OpenVinylFinal.mp4)
+
 
 ## The Engineering Problem: The FDM Noise Floor
 
