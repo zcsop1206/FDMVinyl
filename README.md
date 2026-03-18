@@ -19,6 +19,14 @@ To push quantization noise out of the audible band and compensate for physical r
 3. **Out-of-Band Error Diffusion:** Second-order Lipshitz noise-shaped dithering, pushing the 4-bit quantization error spectrum above the primary audio band.
 4. **Decorrelation:** Triangular PDF (TPDF) dithering to eliminate harmonic distortion artifacts caused by the 16-level quantization limit.
 
+## Mechanical Mapping Engine (`src/wav_to_record.py`)
+
+The conditioned digital signal is physically mapped into a 3D coordinate system ($r, \theta, z$) to generate the final STL mesh for physical manufacture:
+
+1. **Spiral Formulation:** Generates a modulated Archimedean spiral with high-fidelity vertex density.
+2. **Kinematic Parameterization:** Dynamically scales groove modulation for the 150 RPM custom test rig to maximize effective temporal resolution.
+3. **FDM Mesh Generation:** Structural geometry is generated at a 0.01mm resolution to ensure the fidelity is limited only by manufacturing nozzle and layer height.
+
 ## Physical Rig Design
 
 Temporal resolution is strictly bound by the angular velocity of the record. To maximize the sample rate at the perimeter, I bypassed standard turntable speeds (33/45 RPM) and designed a custom direct-drive test rig operating at **150 RPM**.
