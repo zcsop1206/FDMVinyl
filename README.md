@@ -1,44 +1,111 @@
-# Open Vinyl: 4-Bit Mechanical Audio Encoding
+# OpenVinyl
 
-A full signal conditioning and structural mapping pipeline that encodes digital audio into 3D-printable groove geometry. Built to explore physical signal recovery under severe manufacturing constraints.
+Encodes digital audio as Z-axis-modulated groove geometry into FDM-printed records played back on a turntable with a ceramic cartridge.
 
+## Encoding scheme
 
-[![Open Vinyl | 4-Bit Mechanical Audio Encoding](https://img.youtube.com/vi/aqkWe6JU3gI/0.jpg)](https://www.youtube.com/watch?v=aqkWe6JU3gI)
+Commercial vinyl: lateral stylus displacement, 90° V-groove, 25–55 µm features.
+FDM constraint: minimum XY feature = extrusion width w_e ≈ 1.2 × nozzle diameter.
+OpenVinyl: vertical (Z-axis) modulation — groove floor height encodes amplitude.
+Encoding class: Edison hill-and-dale, not lateral-cut vinyl.
 
+## Key derived constraints
 
-## The Engineering Problem: The FDM Noise Floor
+All groove parameters are derived from two hardware inputs: nozzle diameter and layer height (0.08 mm).
 
-Standard FDM 3D printing with a 0.4mm nozzle and 0.08mm layer height introduces a massive structural noise floor. At 0.08mm Z-resolution, the stylus can only resolve **4 bits (16 discrete levels)** of vertical displacement. 
+| Parameter | 0.4 mm nozzle | 0.2 mm nozzle |
+|:---|:---|:---|
+| Extrusion width (w_e) | 0.48 mm | 0.24 mm |
+| Groove pitch (≥ 2 × w_e) | 0.96 mm | 0.48 mm |
+| Land width | 0.48 mm | 0.24 mm |
+| Steps/rev (r = 40 mm) | 523 | 1,047 |
+| Steps/rev (r = 120 mm) | 1,571 | 3,142 |
+| Nyquist at inner radius | 340 Hz | 681 Hz |
+| Nyquist at outer radius | 1,021 Hz | 2,042 Hz |
+| Total grooves (80 mm travel) | 83 | 166 |
+| Recording time at 78 RPM | 64 s | 128 s |
+| Bit depth | 4 (16 levels, 1.28 mm Z-range, 24 dB) | 4 |
 
-Naive quantization of a waveform to 4 bits yields unlistenable static due to severe quantization error. Extracting a listenable signal required building a custom DSP pipeline to condition the data prior to physical encoding.
+**Slope constraint:** A × f ≤ tan(θ_max) × r × RPM / 60.
+At θ_max = 45°, r = 40 mm, 78 RPM: full-amplitude signals above 87 Hz exceed the slope limit. The slope constraint, not bit depth, binds dynamic range at the inner radius.
 
-## Signal Conditioning Pipeline (`src/wav_to_4bit.py`)
+**Stylus geometric filter:** f_geo = v / (2πR).
+At R = 0.5 mm: limits bandwidth to 104–312 Hz — more restrictive than Nyquist. For Nyquist to be the binding constraint: R < 0.076 mm required.
 
-To push quantization noise out of the audible band and compensate for physical rolloff, the pipeline implements:
+**Contact mechanics:** Hertzian analysis gives p_max = 66–78 MPa at 3–5 g VTF, exceeding PLA yield (~50 MPa). Plastic deformation of the groove floor is expected on first play.
 
-1. **Anti-Aliasing:** 4th-order Butterworth low-pass filter (`scipy.signal.butter`) applied via zero-phase `filtfilt`.
-2. **Frequency Compensation:** First-order high-pass pre-emphasis ($\\alpha = 0.97$) to counteract the mechanical high-frequency attenuation of the PLA plastic boundary layer.
-3. **Out-of-Band Error Diffusion:** Second-order Lipshitz noise-shaped dithering, pushing the 4-bit quantization error spectrum above the primary audio band.
-4. **Decorrelation:** Triangular PDF (TPDF) dithering to eliminate harmonic distortion artifacts caused by the 16-level quantization limit.
+## DSP pipeline
 
-## Mechanical Mapping Engine (`src/wav_to_record.py`)
+| Stage | Parameter | Derivation |
+|:---|:---|:---|
+| HPF | 300 Hz | Bandwidth floor — no harmonics below this in [681, 2042] Hz window |
+| LPF | Inner-radius Nyquist (geometry-derived) | Anti-aliasing; replaces previous 8 kHz cutoff |
+| Compression | ≥ 6:1, 18 dB target | 4-bit = 24 dB; 18 dB leaves dithering headroom |
+| Noise shaping | TPDF only | Lipshitz disabled — zero Nyquist headroom for spectral redistribution |
+| Pre-emphasis | **OPEN** — requires H(f) measurement | Characterize from sine sweep test record |
 
-The conditioned digital signal is physically mapped into a 3D coordinate system ($r, \theta, z$) to generate the final STL mesh for physical manufacture:
+## Open parameters
 
-1. **Spiral Formulation:** Generates a modulated Archimedean spiral with high-fidelity vertex density.
-2. **Kinematic Parameterization:** Dynamically scales groove modulation for the 150 RPM custom test rig to maximize effective temporal resolution.
-3. **FDM Mesh Generation:** Structural geometry is generated at a 0.01mm resolution to ensure the fidelity is limited only by manufacturing nozzle and layer height.
+See [PARAMETERS.md](PARAMETERS.md) for the full table of open parameters with bounding approaches and required measurements.
 
-## Physical Rig Design
+Key open parameters:
+- θ_max (stylus max tracking slope) — bounded by cantilever resonance, not compliance
+- Stylus tip radius R — critical design variable determining whether Nyquist or geometric filter binds
+- Pre-emphasis transfer function — requires sine sweep test record
+- RPM stability — 1% variation = 17 cents pitch error, 5% = 85 cents
+- Z positioning accuracy — ±0.02 mm = ±25% of one quantization step
 
-Temporal resolution is strictly bound by the angular velocity of the record. To maximize the sample rate at the perimeter, I bypassed standard turntable speeds (33/45 RPM) and designed a custom direct-drive test rig operating at **150 RPM**.
+## Characterization procedure
 
-The geometry generation (`src/wav_to_record.py`) is fully parameterized, dynamically scaling the STL modulation mapped against the variable `STEPS_PER_REV`.
+1. **Z accuracy:** Print staircase test pattern (Z levels 0–15). Measure actual heights. Compute σ_Z. If σ_Z > h/4, reduce effective bit depth by 1.
 
-## Running the Pipeline
+2. **Noise floor:** Print blank groove (no audio modulation). Record playback. Measure noise floor spectrum. Identify staircase frequency (f = v/h = 4,088–12,238 Hz).
 
-```bash
-pip install -r requirements.txt
-python src/wav_to_4bit.py input.wav output_4bit.wav
-python src/wav_to_record.py output_4bit.wav
+3. **Transfer function:** Print sine sweep (300–2,042 Hz in 50 Hz steps). Record playback. Compute H(f) = Y(f)/X(f). Design pre-emphasis as H⁻¹(f).
+
+4. **RPM stability:** Measure with tachometer over 60+ seconds. 1% variation = 17 cents. 5% = 85 cents (above ±50 cent accuracy threshold).
+
+5. **Slicer verification:** Inspect G-code in Bambu Studio. Verify inner-radius segments (0.24 mm arc length at 0.2 mm nozzle) are not merged.
+
+## Usage
+
+### DSP preprocessing
+
 ```
+python src/wav_to_4bit.py input.wav [output.wav] [--nozzle 0.4] [--rpm 78]
+```
+
+Conditions audio for 4-bit quantization: highpass at 300 Hz, lowpass at geometry-derived Nyquist, 6:1 compression, TPDF dithering. Outputs 16-bit WAV container with 4-bit resolution.
+
+### STL generation
+
+```
+python src/wav_to_record.py input.wav [output.stl] [--rpm 78] [--nozzle 0.4] [--duration 60]
+```
+
+Generates watertight binary STL with groove geometry. Prints all derived parameters (Nyquist limits, triangle count, stylus geometric filter warning) on execution.
+
+### Print settings (Bambu P1S)
+
+| Setting | Value |
+|:---|:---|
+| Layer height | 0.08 mm |
+| Outer wall speed | 35 mm/s |
+| Acceleration | 500 mm/s² |
+| Seam | Random |
+| Supports | None |
+
+## File structure
+
+```
+src/
+  wav_to_4bit.py    DSP preprocessing (V3.0)
+  wav_to_record.py  Groove geometry + STL generation (V8.0)
+PARAMETERS.md       Open parameters table (living document)
+requirements.txt    Python dependencies
+```
+
+## References
+
+- Ghassaei, A. (2012). 3D Printed Record. Instructables.
+- IEC 60098: Analogue audio disk records and reproducing equipment.

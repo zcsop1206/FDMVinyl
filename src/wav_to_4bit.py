@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
 """
-WAV -> 4-bit Audio Converter (Musically Optimized, V2.0)
+WAV -> 4-bit Audio Converter for FDM Vinyl (V3.0)
 
-Produces a listenable 4-bit audio file similar to YouTube 4-bit covers.
-Outputs a 16-bit WAV containing 4-bit quantized audio (standard players
-can't play raw 4-bit, so we store it in 16-bit container — the signal
-itself only has 4-bit resolution).
+DSP preprocessing for OpenVinyl groove encoding. Conditions audio for
+4-bit quantization within the bandwidth constraints of FDM-printed
+groove geometry.
 
-Techniques used (V2.0):
-  - Second-order noise-shaped dithering (Lipshitz-style error diffusion)
-  - Pre-emphasis before quantization + de-emphasis after (like vinyl RIAA)
-  - Configurable low-pass filter with higher default (8kHz)
-  - Soft saturation / harmonic exciter to add warmth
-  - Adaptive quantization (quieter passages get better resolution)
-  - Mid/Side stereo processing for better stereo image
-  - Harmonic exciter post-processing for warmth
-  - Optional sample-rate reduction for chiptune authenticity
-  - Output at original sample rate
+All DSP parameters are derived from groove geometry constraints:
+  - HPF cutoff: 300 Hz (bandwidth floor — no harmonics below this
+    in the [681, 2042] Hz encoding window)
+  - LPF cutoff: geometry-derived inner-radius Nyquist
+  - Compression: ≥6:1 ratio (24 dB range → 18 dB target)
+  - Noise shaping: TPDF only (Lipshitz disabled — zero Nyquist
+    headroom for spectral redistribution at inner radius)
+  - Pre-emphasis: PLACEHOLDER (α=0.97) — requires measured H(f)
+
+Outputs a 16-bit WAV containing 4-bit quantized audio.
 
 Usage:
     python wav_to_4bit.py input.wav [output.wav]
-    python wav_to_4bit.py input.wav output.wav --no-dither
-    python wav_to_4bit.py input.wav output.wav --no-preemphasis
-    python wav_to_4bit.py input.wav output.wav --saturate 0.3
-    python wav_to_4bit.py input.wav output.wav --chiptune          # full lo-fi effect
-    python wav_to_4bit.py input.wav output.wav --sample-rate 11025 # downsample
+    python wav_to_4bit.py input.wav output.wav --nozzle 0.2
+    python wav_to_4bit.py input.wav output.wav --rpm 78
 
 Dependencies: numpy, scipy (optional for better filtering), wave, struct
 """
@@ -107,9 +103,13 @@ def write_wav(path: str, samples: np.ndarray, framerate: int, n_channels: int):
 # =============================================================================
 
 def apply_pre_emphasis(samples: np.ndarray, alpha: float = 0.97) -> np.ndarray:
-    """
-    First-order high-pass pre-emphasis: y[n] = x[n] - alpha * x[n-1]
-    Boosts highs before quantization so they survive the bit-depth reduction.
+    """First-order high-pass pre-emphasis: y[n] = x[n] - alpha * x[n-1]
+
+    PLACEHOLDER: α=0.97 is assumed, not measured. Pre-emphasis should be
+    the inverse of the measured groove-stylus-cartridge transfer function
+    H(f). Characterize by printing a sine sweep test record (300–2042 Hz
+    in 50 Hz steps), recording playback output, and computing
+    H(f) = Y(f)/X(f).
     """
     out = np.zeros_like(samples)
     out[0] = samples[0]
@@ -139,11 +139,37 @@ def apply_de_emphasis(samples: np.ndarray, alpha: float = 0.97) -> np.ndarray:
         return out
 
 
-def apply_lowpass(samples: np.ndarray, framerate: int, cutoff_hz: float = 8000.0) -> np.ndarray:
+def apply_highpass(samples: np.ndarray, framerate: int,
+                   cutoff_hz: float = 300.0) -> np.ndarray:
+    """4th-order Butterworth HPF, zero-phase.
+
+    Cutoff = 300 Hz (derived): content below 300 Hz has no harmonics
+    within the encoding bandwidth window [681, 2042] Hz and only
+    consumes quantization levels without contributing to perceivable
+    audio output.
     """
-    Low-pass filter to remove content above what 4-bit can represent cleanly.
-    Reduces aliasing artifacts from quantization.
-    Uses scipy Butterworth if available, otherwise simple FIR.
+    if HAS_SCIPY:
+        nyquist = framerate / 2.0
+        wn = max(cutoff_hz / nyquist, 0.001)
+        b, a = scipy_signal.butter(4, wn, btype='high')
+        return scipy_signal.filtfilt(b, a, samples)
+    else:
+        # Fallback: subtract lowpass (crude HPF)
+        window = max(1, int(framerate / (cutoff_hz * 2)))
+        kernel = np.ones(window) / window
+        lowpassed = np.convolve(samples, kernel, mode='same')
+        return samples - lowpassed
+
+
+def apply_lowpass(samples: np.ndarray, framerate: int,
+                  cutoff_hz: float = 681.0) -> np.ndarray:
+    """4th-order Butterworth LPF, zero-phase.
+
+    Default cutoff = inner-radius Nyquist (geometry-derived).
+    Content above this aliases into the passband. The previous 8 kHz
+    cutoff was physically meaningless — the groove cannot encode
+    content above ~2,042 Hz at any radius and above ~681 Hz at the
+    inner radius (0.2 mm nozzle, 78 RPM).
     """
     if HAS_SCIPY:
         nyquist = framerate / 2.0
@@ -151,10 +177,67 @@ def apply_lowpass(samples: np.ndarray, framerate: int, cutoff_hz: float = 8000.0
         b, a = scipy_signal.butter(4, wn, btype='low')
         return scipy_signal.filtfilt(b, a, samples)
     else:
-        # Simple moving average FIR fallback
         window = max(1, int(framerate / (cutoff_hz * 2)))
         kernel = np.ones(window) / window
         return np.convolve(samples, kernel, mode='same')
+
+
+def apply_compression(samples: np.ndarray, framerate: int,
+                      ratio: float = 6.0, attack_ms: float = 2.0,
+                      release_ms: float = 50.0,
+                      target_dr_db: float = 18.0) -> np.ndarray:
+    """Dynamic range compression before quantization.
+
+    4-bit gives 24 dB theoretical dynamic range. Input audio typically
+    has 40+ dB dynamic range — quiet passages occupy 2–3 quantization
+    levels and are indistinguishable from quantization noise. Compressing
+    to ≤18 dB ensures the signal occupies most of the 16 available levels
+    throughout. 18 dB target leaves headroom for dithering overshoot.
+    """
+    # Compute envelope using RMS
+    window = max(1, int(framerate * attack_ms / 1000.0))
+    sq = samples ** 2
+    kernel = np.ones(window) / window
+    rms = np.sqrt(np.convolve(sq, kernel, mode='same') + 1e-12)
+
+    # Compute gain reduction
+    peak_rms = np.max(rms)
+    if peak_rms <= 0:
+        return samples
+
+    rms_db = 20.0 * np.log10(rms / peak_rms + 1e-12)
+    threshold_db = -target_dr_db
+
+    # Compress above threshold
+    gain_db = np.where(
+        rms_db > threshold_db,
+        rms_db * (1.0 - 1.0/ratio),
+        0.0
+    )
+    gain = 10.0 ** (-gain_db / 20.0)
+
+    # Smooth gain changes (attack/release)
+    attack_samples = max(1, int(framerate * attack_ms / 1000.0))
+    release_samples = max(1, int(framerate * release_ms / 1000.0))
+    alpha_a = 1.0 - np.exp(-1.0 / attack_samples)
+    alpha_r = 1.0 - np.exp(-1.0 / release_samples)
+
+    smoothed_gain = np.zeros_like(gain)
+    smoothed_gain[0] = gain[0]
+    for i in range(1, len(gain)):
+        if gain[i] < smoothed_gain[i-1]:
+            smoothed_gain[i] = smoothed_gain[i-1] + alpha_a * (gain[i] - smoothed_gain[i-1])
+        else:
+            smoothed_gain[i] = smoothed_gain[i-1] + alpha_r * (gain[i] - smoothed_gain[i-1])
+
+    compressed = samples * smoothed_gain
+
+    # Normalize
+    peak = np.max(np.abs(compressed))
+    if peak > 0:
+        compressed /= peak
+
+    return compressed
 
 
 def soft_saturate(samples: np.ndarray, amount: float = 0.2) -> np.ndarray:
@@ -378,80 +461,125 @@ def process_channel(samples_1d: np.ndarray, framerate: int, args,
                     is_side: bool = False) -> np.ndarray:
     """
     Full processing chain for a single channel (or mid/side component).
-    
-    V2 processing chain:
-    1. Soft saturation (tanh waveshaping, adds harmonics)
-    2. Optional sample-rate reduction (chiptune effect)
-    3. Low-pass filter (configurable cutoff, default 8kHz)
-    4. Pre-emphasis (first-order high-pass)
-    5. Noise-shaped quantization (second-order Lipshitz error diffusion)
-    6. De-emphasis (IIR low-pass, via scipy lfilter for speed)
-    7. Harmonic exciter (post-quantization warmth)
+
+    V3 processing chain (geometry-derived):
+    1. HPF at 300 Hz (bandwidth floor)
+    2. Soft saturation
+    3. Optional sample-rate reduction
+    4. LPF at inner-radius Nyquist (geometry-derived)
+    5. Dynamic range compression (6:1 → 18 dB target)
+    6. Pre-emphasis (PLACEHOLDER α=0.97)
+    7. TPDF dithered 4-bit quantization (Lipshitz shaping disabled)
+    8. De-emphasis
+    9. Harmonic exciter
     """
     working_rate = framerate
-    
-    # 1. Soft saturation (before quantization for harmonic content)
+
+    # 1. HPF — remove content below 300 Hz
+    # Content below 300 Hz has no harmonics in the encoding bandwidth
+    # window [681, 2042] Hz. It consumes quantization levels without
+    # contributing to perceivable audio.
+    if not args.no_highpass:
+        samples_1d = apply_highpass(samples_1d, working_rate, args.highpass_hz)
+        print(f"    HPF applied (cutoff={args.highpass_hz:.0f}Hz — "
+              f"bandwidth floor)")
+
+    # 2. Soft saturation (before quantization for harmonic content)
     sat_amount = args.saturate
     if is_side:
-        sat_amount *= 0.5  # less saturation on side channel to preserve stereo
+        sat_amount *= 0.5
     if sat_amount > 0:
         samples_1d = soft_saturate(samples_1d, sat_amount)
         print(f"    Soft saturation applied (amount={sat_amount:.2f})")
 
-    # 2. Optional sample-rate reduction (chiptune effect)
+    # 3. Optional sample-rate reduction (chiptune effect)
     if args.sample_rate and args.sample_rate < framerate:
         target_rate = args.sample_rate
         samples_1d = resample(samples_1d, framerate, target_rate)
         working_rate = target_rate
         print(f"    Resampled {framerate}Hz -> {target_rate}Hz")
 
-    # 3. Optional low-pass to reduce aliasing
+    # 4. LPF — anti-aliasing at geometry-derived Nyquist
     if not args.no_lowpass:
         cutoff = min(args.lowpass_hz, working_rate / 2.0 - 1)
         samples_1d = apply_lowpass(samples_1d, working_rate, cutoff)
-        print(f"    Low-pass filter applied (cutoff={cutoff:.0f}Hz)")
+        if cutoff > args.f_nyquist_inner:
+            print(f"    WARNING: LPF cutoff ({cutoff:.0f}Hz) exceeds "
+                  f"inner-radius Nyquist ({args.f_nyquist_inner:.0f}Hz)")
+        print(f"    LPF applied (cutoff={cutoff:.0f}Hz — "
+              f"geometry-derived Nyquist)")
 
-    # 4. Pre-emphasis (boost highs before quantization)
+    # 5. Dynamic range compression
+    # 4-bit = 24 dB theoretical. Compress to ≤18 dB so signal occupies
+    # most of the 16 levels throughout. 18 dB target leaves headroom
+    # for dithering overshoot.
+    if not args.no_compression:
+        samples_1d = apply_compression(
+            samples_1d, working_rate,
+            ratio=args.compression_ratio,
+            target_dr_db=18.0
+        )
+        print(f"    Compression applied (ratio={args.compression_ratio:.0f}:1, "
+              f"target=18dB)")
+
+    # 6. Pre-emphasis
+    # PLACEHOLDER: α=0.97 is not measured. Pre-emphasis should be the
+    # inverse of the measured groove-stylus-cartridge transfer function.
+    # Characterize from sine sweep test record before final use.
     if not args.no_preemphasis:
-        # Use milder pre-emphasis for side channel
         alpha = args.preemphasis_alpha if not is_side else args.preemphasis_alpha * 0.7
         samples_1d = apply_pre_emphasis(samples_1d, alpha)
-        # Renormalize after emphasis
         peak = np.max(np.abs(samples_1d))
         if peak > 0:
             samples_1d /= peak
-        print(f"    Pre-emphasis applied (alpha={alpha:.2f})")
+        print(f"    Pre-emphasis applied (alpha={alpha:.2f} — PLACEHOLDER)")
 
-    # 5. 4-bit quantization with noise shaping
+    # 7. 4-bit quantization with TPDF dithering
+    # Lipshitz noise shaping coefficients (1.5, -0.5) are designed for
+    # 44.1 kHz audio with a shaping target above ~15 kHz. At inner-radius
+    # Nyquist of {f_nyquist_inner} Hz, the audio band fills the full
+    # Nyquist range — zero spectral headroom for noise redistribution.
+    # Shaped error aliases back into the passband. TPDF dithering is
+    # applied; spectral shaping is disabled.
+    # Revisit if adaptive LPF is implemented on outer grooves.
     if not args.no_dither:
-        ns_order = args.noise_shaping_order
-        print(f"    Noise-shaped 4-bit quantization (order={ns_order})...")
+        # Force order=0 to disable Lipshitz shaping, use TPDF only
+        print(f"    TPDF dithered 4-bit quantization "
+              f"(Lipshitz shaping disabled — zero Nyquist headroom)...")
         t0 = time.time()
-        samples_1d = noise_shaped_quantize_4bit_fast(samples_1d, order=ns_order)
+        # Use naive quantization + TPDF dither (no error feedback)
+        NUM_LEVELS = 16
+        mapped = (samples_1d + 1.0) * 0.5 * (NUM_LEVELS - 1)
+        # TPDF dither: triangular PDF noise
+        r1 = np.random.uniform(-0.5, 0.5, len(mapped))
+        r2 = np.random.uniform(-0.5, 0.5, len(mapped))
+        mapped = mapped + r1 + r2
+        quantized = np.round(np.clip(mapped, 0, NUM_LEVELS - 1))
+        samples_1d = (quantized / (NUM_LEVELS - 1)) * 2.0 - 1.0
         elapsed = time.time() - t0
         print(f"    Quantization took {elapsed:.2f}s")
     else:
-        print(f"    Naive 4-bit quantization (no noise shaping)...")
+        print(f"    Naive 4-bit quantization (no dithering)...")
         NUM_LEVELS = 16
         mapped = (samples_1d + 1.0) * 0.5 * (NUM_LEVELS - 1)
         quantized = np.round(np.clip(mapped, 0, NUM_LEVELS - 1))
         samples_1d = (quantized / (NUM_LEVELS - 1)) * 2.0 - 1.0
 
-    # 6. De-emphasis (restore frequency balance)
+    # 8. De-emphasis (restore frequency balance)
     if not args.no_preemphasis:
         alpha = args.preemphasis_alpha if not is_side else args.preemphasis_alpha * 0.7
         samples_1d = apply_de_emphasis(samples_1d, alpha)
         peak = np.max(np.abs(samples_1d))
         if peak > 0:
             samples_1d /= peak
-        print(f"    De-emphasis applied (via {'scipy lfilter' if HAS_SCIPY else 'Python loop'})")
+        print(f"    De-emphasis applied")
 
-    # 7. Harmonic exciter (post-quantization warmth)
+    # 9. Harmonic exciter
     if args.exciter > 0:
         samples_1d = harmonic_exciter(samples_1d, args.exciter)
         print(f"    Harmonic exciter applied (amount={args.exciter:.2f})")
 
-    # 8. Upsample back to original rate if we downsampled
+    # 10. Upsample back if downsampled
     if args.sample_rate and args.sample_rate < framerate:
         samples_1d = resample(samples_1d, args.sample_rate, framerate)
         print(f"    Resampled {args.sample_rate}Hz -> {framerate}Hz")
@@ -488,55 +616,76 @@ def process_stereo_midside(left: np.ndarray, right: np.ndarray,
 # =============================================================================
 
 def main():
+    import math as _math
+
     parser = argparse.ArgumentParser(
-        description='Convert WAV to musical 4-bit audio (V2.0)',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""\
-Examples:
-  python wav_to_4bit.py song.wav                          # Default settings (recommended)
-  python wav_to_4bit.py song.wav out.wav --saturate 0.4   # More warmth/harmonics
-  python wav_to_4bit.py song.wav out.wav --no-dither       # Harsh, reference only
-  python wav_to_4bit.py song.wav out.wav --lowpass-hz 4000 # More lo-fi
-  python wav_to_4bit.py song.wav out.wav --chiptune        # Full lo-fi Game Boy effect
-  python wav_to_4bit.py song.wav out.wav --sample-rate 11025 # Downsample for crunch
-        """
-    )
+        description='WAV to 4-bit audio for FDM vinyl (V3.0)',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('input', help='Input WAV file')
-    parser.add_argument('output', nargs='?', help='Output WAV file (default: input_4bit.wav)')
+    parser.add_argument('output', nargs='?',
+                        help='Output WAV (default: input_4bit.wav)')
+
+    # Groove geometry (for deriving DSP parameters)
+    parser.add_argument('--nozzle', type=float, default=0.4,
+                        help='Nozzle diameter in mm (default: 0.4)')
+    parser.add_argument('--rpm', type=float, default=78.0,
+                        help='Turntable RPM (default: 78)')
+    parser.add_argument('--r-inner', type=float, default=40.0,
+                        help='Inner groove radius in mm (default: 40)')
+
+    # DSP controls
     parser.add_argument('--no-dither', action='store_true',
-                        help='Disable noise shaping (naive quantization, sounds harsh)')
+                        help='Disable TPDF dithering')
     parser.add_argument('--no-preemphasis', action='store_true',
                         help='Disable pre/de-emphasis')
     parser.add_argument('--no-lowpass', action='store_true',
-                        help='Disable anti-aliasing low-pass filter')
-    parser.add_argument('--lowpass-hz', type=float, default=8000.0,
-                        help='Low-pass cutoff frequency in Hz (default: 8000)')
+                        help='Disable LPF')
+    parser.add_argument('--no-highpass', action='store_true',
+                        help='Disable HPF')
+    parser.add_argument('--no-compression', action='store_true',
+                        help='Disable dynamic range compression')
+    parser.add_argument('--lowpass-hz', type=float, default=None,
+                        help='LPF cutoff Hz (default: geometry-derived)')
+    parser.add_argument('--highpass-hz', type=float, default=300.0,
+                        help='HPF cutoff Hz (default: 300, bandwidth floor)')
     parser.add_argument('--preemphasis-alpha', type=float, default=0.97,
-                        help='Pre-emphasis alpha (default: 0.97, range: 0.90-0.99)')
+                        help='Pre-emphasis alpha (default: 0.97, PLACEHOLDER)')
+    parser.add_argument('--compression-ratio', type=float, default=6.0,
+                        help='Compression ratio (default: 6.0)')
     parser.add_argument('--saturate', type=float, default=0.15,
-                        help='Soft saturation amount 0-1 (default: 0.15, 0 to disable)')
+                        help='Soft saturation amount (default: 0.15)')
+    parser.add_argument('--exciter', type=float, default=0.06,
+                        help='Harmonic exciter amount (default: 0.06)')
     parser.add_argument('--mono', action='store_true',
                         help='Force mono output')
-    
-    # V2 new options
-    parser.add_argument('--noise-shaping-order', type=int, default=2, choices=[1, 2],
-                        help='Noise shaping order: 1=original, 2=Lipshitz (default: 2)')
-    parser.add_argument('--exciter', type=float, default=0.06,
-                        help='Post-quantization harmonic exciter amount (default: 0.06, 0 to disable)')
     parser.add_argument('--no-midside', action='store_true',
-                        help='Disable Mid/Side stereo processing (process L/R independently)')
+                        help='Disable Mid/Side stereo processing')
     parser.add_argument('--sample-rate', type=int, default=None,
-                        help='Downsample to this rate before quantizing (e.g. 11025 for chiptune)')
+                        help='Downsample before quantizing')
     parser.add_argument('--chiptune', action='store_true',
-                        help='Preset: lo-fi Game Boy style (11025Hz, 4kHz LP, heavy saturation)')
+                        help='Preset: lo-fi (11025Hz, 4kHz LP, heavy sat)')
+    # Kept for backward compat but ignored
+    parser.add_argument('--noise-shaping-order', type=int, default=0,
+                        help=argparse.SUPPRESS)
 
     args = parser.parse_args()
-    
-    # Apply chiptune preset
+
+    # Compute geometry-derived DSP parameters
+    w_e = 1.2 * args.nozzle
+    steps_inner = int(2.0 * _math.pi * args.r_inner / w_e)
+    f_s_inner = steps_inner * args.rpm / 60.0
+    f_nyquist_inner = f_s_inner / 2.0
+    args.f_nyquist_inner = f_nyquist_inner
+
+    # Default LPF to inner-radius Nyquist if not set
+    if args.lowpass_hz is None:
+        args.lowpass_hz = f_nyquist_inner
+
+    # Chiptune preset
     if args.chiptune:
         if args.sample_rate is None:
             args.sample_rate = 11025
-        if args.lowpass_hz == 8000.0:  # only override if user didn't set
+        if args.lowpass_hz == f_nyquist_inner:
             args.lowpass_hz = 4000.0
         if args.saturate == 0.15:
             args.saturate = 0.35
@@ -547,23 +696,29 @@ Examples:
     out_path = args.output or os.path.splitext(in_path)[0] + '_4bit.wav'
 
     print("=" * 60)
-    print("WAV -> 4-bit Audio Converter (Musically Optimized, V2.0)")
+    print("WAV -> 4-bit Audio for FDM Vinyl (V3.0)")
     print("=" * 60)
-    
-    # Print active settings
-    print(f"\n  Settings:")
-    print(f"    Noise shaping:    {'order ' + str(args.noise_shaping_order) if not args.no_dither else 'OFF (naive)'}")
-    print(f"    Pre/De-emphasis:  {'alpha=' + str(args.preemphasis_alpha) if not args.no_preemphasis else 'OFF'}")
-    print(f"    Low-pass:         {str(args.lowpass_hz) + 'Hz' if not args.no_lowpass else 'OFF'}")
-    print(f"    Saturation:       {args.saturate}")
-    print(f"    Harmonic exciter: {args.exciter}")
-    print(f"    Sample rate:      {str(args.sample_rate) + 'Hz' if args.sample_rate else 'native'}")
-    print(f"    Stereo mode:      {'L/R independent' if args.no_midside else 'Mid/Side'}")
+
+    # Print geometry-derived parameters
+    print(f"\n  Geometry-derived DSP parameters:")
+    print(f"    Nozzle:           {args.nozzle} mm")
+    print(f"    Extrusion width:  {w_e:.2f} mm")
+    print(f"    Steps/rev (inner): {steps_inner}")
+    print(f"    HPF cutoff:       {args.highpass_hz:.0f} Hz "
+          f"(bandwidth floor)")
+    print(f"    LPF cutoff:       {args.lowpass_hz:.1f} Hz "
+          f"(inner-radius Nyquist — geometry-derived)")
+    print(f"    Compression:      {args.compression_ratio:.0f}:1 "
+          f"(24 dB range -> 18 dB target)")
+    print(f"    Noise shaping:    TPDF only "
+          f"(Lipshitz disabled — zero headroom at "
+          f"inner Nyquist)")
+    print(f"    Pre-emphasis:     PLACEHOLDER (alpha={args.preemphasis_alpha}) "
+          f"— characterize from test record")
 
     print("\n[1/3] Loading audio...")
     samples, framerate, n_channels = read_wav(in_path)
 
-    # Force mono if requested
     if args.mono and n_channels > 1:
         samples = samples.mean(axis=1)
         n_channels = 1
@@ -571,39 +726,30 @@ Examples:
 
     print("\n[2/3] Processing...")
     t_start = time.time()
-    
+
     if n_channels == 1:
         samples_out = process_channel(samples, framerate, args)
     elif n_channels == 2 and not args.no_midside:
-        # Mid/Side stereo processing (V2 default for stereo)
         left_out, right_out = process_stereo_midside(
             samples[:, 0], samples[:, 1], framerate, args)
         samples_out = np.stack([left_out, right_out], axis=1)
     else:
-        # Process each channel independently
         channels_out = []
         for ch in range(n_channels):
             print(f"  Channel {ch+1}/{n_channels}:")
-            channels_out.append(process_channel(samples[:, ch], framerate, args))
+            channels_out.append(
+                process_channel(samples[:, ch], framerate, args))
         samples_out = np.stack(channels_out, axis=1)
 
     t_elapsed = time.time() - t_start
-    print(f"\n  Total processing time: {t_elapsed:.2f}s")
+    print(f"\n  Processing time: {t_elapsed:.2f}s")
 
     print("\n[3/3] Saving...")
     write_wav(out_path, samples_out, framerate, n_channels)
 
     print("\n" + "=" * 60)
-    print("Done!")
     print(f"  Input:  {in_path}")
     print(f"  Output: {out_path}")
-    print("\nTips for best results:")
-    print("  - Use WAV or FLAC input (not MP3)")
-    print("  - Try --saturate 0.3 for more warmth")
-    print("  - Try --lowpass-hz 4000 for a more lo-fi Game Boy sound")
-    print("  - Try --chiptune for full lo-fi effect (downsample + heavy saturation)")
-    print("  - Try --noise-shaping-order 1 to compare first vs second order")
-    print("  - The output is stored in a 16-bit container but has 4-bit resolution")
     print("=" * 60)
 
 
